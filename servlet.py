@@ -95,7 +95,6 @@ class ListHandler(BaseHandler):
 
 class ThreadableMixin:
     def start_worker (self, *args):
-        logging.info("started thread")
         threading.Thread(target = self.worker, args=args).start()
  
     def worker (self, *args):
@@ -109,7 +108,6 @@ class ThreadableMixin:
         tornado.ioloop.IOLoop.instance().add_callback(self.async_callback (self.results))
  
     def results (self):
-        logging.info("results of thread:")
         if self.get_status () != 200:
             self.send_error (self.get_status ())
             return
@@ -183,13 +181,8 @@ class TranslateHandler(BaseHandler, ThreadableMixin):
 
         if '%s-%s' % (l1, l2) in self.pairs:
             self.runPipeline(l1, l2)
-            logging.info("Currently open pipelines: %d"%(len(self.pipelines)))
             self.start_worker(toTranslate, l1, l2)
-            # try:
-            #     translation = result.get(timeout = self.timeout)
-            # except TimeoutError:
-            #     self.send_error(408)
-            #     pool.terminate()
+            # TODO real callback
         else:
             self.send_error(400)
 
