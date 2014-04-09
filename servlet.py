@@ -92,7 +92,81 @@ class ListHandler(BaseHandler):
         else:
             self.send_error(400)
 
-class TranslateHandler(BaseHandler):
+
+class ThreadableMixin:
+    def start_worker (self, *args):
+        logging.info("started thread")
+        threading.Thread(target = self.worker, args=args).start()
+ 
+    def worker (self, *args):
+        try:
+            self._worker (*args)
+        except tornado.web.HTTPError:
+            self.set_status(408) # TODO e.status_code
+        except:
+            logging.error("_worker problem ", exc_info = True)
+            self.set_status(500)
+        tornado.ioloop.IOLoop.instance().add_callback(self.async_callback (self.results))
+ 
+    def results (self):
+        logging.info("results of thread:")
+        if self.get_status () != 200:
+            self.send_error (self.get_status ())
+            return
+        if hasattr (self, 'res'):
+            self.finish (self.res)
+            return
+        if hasattr (self, 'redir'):
+            self.redirect (self.redir)
+            return
+        self.send_error (500)
+
+class TranslateHandler(BaseHandler, ThreadableMixin):
+    def getModeFileLine(self, modeFile):
+        modeFileContents = open(modeFile, 'r').readlines()
+        modeFileLine = None
+        for line in modeFileContents:
+            if '|' in line:
+                modeFileLine = line
+        if modeFileLine != None:
+            commands = modeFileLine.split('|')
+            outCommands = []
+            for command in commands:
+                command = command.strip()
+                if re.search('apertium-pretransfer', command):
+                    outCommand = command+" -z"
+                else:
+                    outCommand = re.sub('^(.*?)\s(.*)$', '\g<1> -z \g<2>', command)
+                outCommand = re.sub('\s{2,}', ' ', outCommand)
+                outCommands.append(outCommand)
+            toReturn = ' | '.join(outCommands)
+            toReturn = re.sub('\s*\$2', '', re.sub('\$1', '-g', toReturn))
+            return toReturn
+        # TODO: on failure?
+
+    def runPipeline(self, l1, l2):
+        if (l1,l2) not in self.pipelines:
+            logging.info("%s,%s not in pipelines of this process, starting …" %(l1,l2)) 
+            modeFile = self.pairs['%s-%s' %(l1,l2)]
+            modeFileLine = self.getModeFileLine(modeFile)
+            commandList = []
+            if modeFileLine:
+                commandList = [ c.strip().split() for c in
+                                modeFileLine.split('|') ]
+                commandsDone = []
+                for command in commandList:
+                    if len(commandsDone)>0:
+                        newP = Popen(command, stdin=commandsDone[-1].stdout, stdout=PIPE)
+                    else:
+                        newP = Popen(command, stdin=PIPE, stdout=PIPE)
+                    commandsDone.append(newP)
+
+                self.pipelines[(l1,l2)] = (commandsDone[0], commandsDone[-1])
+
+    def _worker (self, toTranslate, l1, l2):
+        self.res = translate(toTranslate, l1, l2, self.translock, self.pipelines, self.pairs)
+
+    @tornado.web.asynchronous
     def get(self):
         (l1, l2) = self.get_argument('langpair').split('|')
         toTranslate = self.get_argument('q')
@@ -108,14 +182,14 @@ class TranslateHandler(BaseHandler):
                 self.sendResponse(toReturn)
 
         if '%s-%s' % (l1, l2) in self.pairs:
-            pool = Pool(processes = 1)
-            result = pool.apply_async(translate, [toTranslate, (l1, l2), self.translock, self.pipelines, self.pairs], callback = handleTranslation)
-            pool.close()
-            try:
-                translation = result.get(timeout = self.timeout)
-            except TimeoutError:
-                self.send_error(408)
-                pool.terminate()
+            self.runPipeline(l1, l2)
+            logging.info("Currently open pipelines: %d"%(len(self.pipelines)))
+            self.start_worker(toTranslate, l1, l2)
+            # try:
+            #     translation = result.get(timeout = self.timeout)
+            # except TimeoutError:
+            #     self.send_error(408)
+            #     pool.terminate()
         else:
             self.send_error(400)
 
