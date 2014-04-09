@@ -32,10 +32,10 @@ def hardbreakFn():
     These numbers could probably be tweaked a lot.
     """
     if threading.active_count()>2:
-        hardbreak=10000
+        hardbreak=1000
         # TODO: would prefer "translock.waiting_count", but doesn't seem exist
     else:
-        hardbreak=50000
+        hardbreak=5000
     return hardbreak
     
 def translateSplitting(toTranslate, l1, l2, translock, pipelines, pairs):
@@ -45,14 +45,18 @@ def translateSplitting(toTranslate, l1, l2, translock, pipelines, pairs):
     last=0
     while last<len(toTranslate):
         hardbreak = hardbreakFn()
-        # We would prefer to split on a period seen before the
-        # hardbreak, if we can:
+        # We would prefer to split on a period or space seen before
+        # the hardbreak, if we can:
         softbreak = int(hardbreak*0.9)
         dot=toTranslate.find(".", last+softbreak, last+hardbreak)
         if dot>-1:
             next=dot
         else:
-            next=last+hardbreak
+            space=toTranslate.find(" ", last+softbreak, last+hardbreak)
+            if space>-1:
+                next=space
+            else:
+                next=last+hardbreak
         allSplit.append(translateNULFlush(toTranslate[last:next], l1, l2, translock, pipelines, pairs))
         last=next
     return "".join(allSplit)
