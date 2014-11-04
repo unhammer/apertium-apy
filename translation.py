@@ -1,5 +1,6 @@
 import re, threading, os, tempfile
 from subprocess import Popen, PIPE
+from tornado import gen
 import logging
 
 def parseModeFile(mode_path):
@@ -28,8 +29,36 @@ def parseModeFile(mode_path):
         logging.error('Could not parse mode file %s' % mode_path)
         raise Exception('Could not parse mode file %s' % mode_path)
 
+@gen.coroutine
+def translateSplitting(toTranslate, translock, pipeline):
+    """Splitting it up a bit ensures we don't fill up FIFO buffers (leads
+    to processes hanging on read/write)."""
+    allSplit = []	# [].append and join faster than str +=
+    last=0
+    while last < len(toTranslate):
+        hardbreak = hardbreakFn()
+        # We would prefer to split on a period or space seen before
+        # the hardbreak, if we can:
+        softbreak = int(hardbreak*0.9)
+        dot = toTranslate.find(".", last+softbreak, last+hardbreak)
+        if dot>-1:
+            cur = dot
+        else:
+            space = toTranslate.find(" ", last+softbreak, last+hardbreak)
+            if space>-1:
+                cur = space
+            else:
+                cur = last+hardbreak
+        allSplit.append(toTranslate[last:cur])
+        last = cur
+    res = yield [translateNULFlush(part, translock, pipeline) for part in allSplit]
+    return res
+    
+@gen.coroutine
 def translateNULFlush(toTranslate, translock, pipeline):
+    logging.info(translock)
     with translock:
+        logging.info(translock)
         proc_in, proc_out, do_flush = pipeline
         assert(do_flush)
 
@@ -39,17 +68,15 @@ def translateNULFlush(toTranslate, translock, pipeline):
 
         proc_in.stdin.write(deformatted)
         proc_in.stdin.write(bytes('\0', "utf-8"))
-        proc_in.stdin.flush()
+        # TODO: PipeIOStream has no flush, but seems to work anyway?
+        #proc_in.stdin.flush()
 
-        d = proc_out.stdout.read(1)
-        output = []
-        while d and d != b'\x00':
-            output.append(d)
-            d = proc_out.stdout.read(1)
+        line = yield proc_out.stdout.read_until(bytes('\0', 'utf-8'))
+        return line
 
-        proc_reformat = Popen("apertium-rehtml-noent", stdin=PIPE, stdout=PIPE)
-        proc_reformat.stdin.write(b"".join(output))
-        return proc_reformat.communicate()[0].decode('utf-8')
+        # proc_reformat = Popen("apertium-rehtml-noent", stdin=PIPE, stdout=PIPE)
+        # proc_reformat.stdin.write(output)
+        # return proc_reformat.communicate()[0].decode('utf-8')
 
 def hardbreakFn():
     """If others are waiting on us, we send short requests, otherwise we
@@ -68,29 +95,6 @@ def hardbreakFn():
     else:
         hardbreak=5000
     return hardbreak
-
-def translateSplitting(toTranslate, translock, pipeline):
-    """Splitting it up a bit ensures we don't fill up FIFO buffers (leads
-    to processes hanging on read/write)."""
-    allSplit = []	# [].append and join faster than str +=
-    last=0
-    while last<len(toTranslate):
-        hardbreak = hardbreakFn()
-        # We would prefer to split on a period or space seen before
-        # the hardbreak, if we can:
-        softbreak = int(hardbreak*0.9)
-        dot=toTranslate.find(".", last+softbreak, last+hardbreak)
-        if dot>-1:
-            next=dot
-        else:
-            space=toTranslate.find(" ", last+softbreak, last+hardbreak)
-            if space>-1:
-                next=space
-            else:
-                next=last+hardbreak
-        allSplit.append(translateNULFlush(toTranslate[last:next], translock, pipeline))
-        last=next
-    return "".join(allSplit)
 
 def translateWithoutFlush(toTranslate, translock, pipeline):
     proc_deformat = Popen("apertium-deshtml", stdin=PIPE, stdout=PIPE)
@@ -111,20 +115,28 @@ def translateWithoutFlush(toTranslate, translock, pipeline):
     proc_reformat.stdin.write(b"".join(output))
     return proc_reformat.communicate()[0].decode('utf-8')
 
+@gen.coroutine
 def translateSimple(toTranslate, translock, pipeline):
     with translock:
         proc_in, proc_out, do_flush = pipeline
         assert(not do_flush)
         assert(proc_in==proc_out)
-        translated = proc_in.communicate(input=bytes(toTranslate, 'utf-8'))[0]
-        return translated.decode('utf-8')
+        logging.info("writing")
+        proc_in.stdin.write(bytes(toTranslate, 'utf-8'))
+        proc_in.stdin.close()
+        logging.info("reading")
+        translated = yield proc_out.stdout.read_until_close()
+        logging.info(translated)
+        return [translated]
 
 def translateDoc(fileToTranslate, format, modeFile):
     return Popen(['apertium', '-f %s' % format, '-d %s' % os.path.dirname(os.path.dirname(modeFile)), os.path.splitext(os.path.basename(modeFile))[0]], stdin=fileToTranslate, stdout=PIPE).communicate()[0]
 
+@gen.coroutine
 def translate(toTranslate, translock, pipeline):
     _, _, do_flush = pipeline
     if do_flush:
-        return translateSplitting(toTranslate, translock, pipeline)
+        res = yield translateSplitting(toTranslate, translock, pipeline)
     else:
-        return translateSimple(toTranslate, translock, pipeline)
+        res = yield translateSimple(toTranslate, translock, pipeline)
+    return res

@@ -11,7 +11,7 @@ from functools import wraps
 from threading import Thread
 from datetime import datetime
 
-import tornado, tornado.web, tornado.httpserver
+import tornado, tornado.web, tornado.httpserver, tornado.process
 from tornado import escape, gen
 from tornado.escape import utf8
 try: #3.1
@@ -159,31 +159,7 @@ class StatsHandler(BaseHandler):
             'responseStatus': 200
         })
 
-class ThreadableMixin:
-    '''To use:
-
-    1) inherit this class
-    2) define a self._worker that sets self.res to whatever the result value should be.
-    3) define a self._handler that checks for hasattr(self, 'res')
-    4) start the worker with self.start_worker(self._handler, arg1, arg2, …, argn)
-       where arg1…argn are passed on to self._worker
-
-    '''
-    def start_worker(self, *args):
-        # TODO: max threads, using https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.ThreadPoolExecutor
-        threading.Thread(target=self.run_worker, args=args).start()
-
-    def run_worker(self, result_handler, *worker_args):
-        try:
-            self._worker(*worker_args)
-        except tornado.web.HTTPError:
-            self.set_status(408) # TODO e.status_code
-        except:
-            logging.error('_worker problem ', exc_info=True)
-            self.set_status(500)
-        tornado.ioloop.IOLoop.instance().add_callback(result_handler)
-
-class TranslateHandler(BaseHandler, ThreadableMixin):
+class TranslateHandler(BaseHandler):
     def notePairUsage(self, pair):
         self.stats['useCount'][pair] = 1 + self.stats['useCount'].get(pair, 0)
         if self.max_idle_secs:
@@ -222,17 +198,23 @@ class TranslateHandler(BaseHandler, ThreadableMixin):
             mode_path = self.pairs['%s-%s' % (l1, l2)]
             try:
                 do_flush, commands = parseModeFile(mode_path)
-            except Exception:
-                self.send_error(500)
+            except Exception as e:
+                self.send_error(500, explanation="mode error")
                 return
 
             procs = []
-            for cmd in commands:
-                if len(procs)>0:
-                    newP = Popen(cmd, stdin=procs[-1].stdout, stdout=PIPE)
+            for i, cmd in enumerate(commands):
+                if i == 0:
+                    in_from = tornado.process.Subprocess.STREAM
                 else:
-                    newP = Popen(cmd, stdin=PIPE, stdout=PIPE)
-                procs.append(newP)
+                    in_from = procs[-1].stdout
+                if i == len(commands)-1:
+                    out_from = tornado.process.Subprocess.STREAM
+                else:
+                    out_from = PIPE
+                procs.append(tornado.process.Subprocess(cmd,
+                                                        stdin=in_from,
+                                                        stdout=out_from))
 
             self.pipeline_locks[(l1, l2)] = threading.RLock()
             self.pipelines[(l1, l2)] = (procs[0], procs[-1], do_flush)
@@ -279,27 +261,25 @@ class TranslateHandler(BaseHandler, ThreadableMixin):
 
             return
 
-        def handleTranslation():
-            if self.get_status() != 200:
-                self.send_error(self.get_status())
-                return
-            if hasattr(self, 'res'):
-                self.noteUnknownTokens('-'.join((l1, l2)), self.res)
-                self.res = self.res if markUnknown else self.stripUnknownMarks(self.res)
-                self.sendResponse({
-                    'responseData': {'translatedText': self.res},
-                   'responseDetails': None,
-                   'responseStatus': 200
-                })
-                return
-            if hasattr(self, 'redir'):
-                self.redirect(self.redir)
-                return
-            logging.error('handleTranslation reached a thought-to-be-unreachable line')
-            self.send_error(500)
+        def handleTranslation(fut):
+            res = fut.result()
+            translated = b"".join(res).decode('utf-8')
+            self.noteUnknownTokens('-'.join((l1, l2)), translated)
+            translatedU = translated if markUnknown else self.stripUnknownMarks(translated)
+            self.sendResponse({
+                'responseData': {'translatedText': translatedU},
+               'responseDetails': None,
+               'responseStatus': 200
+            })
+            return
 
         if '%s-%s' % (l1, l2) in self.pairs:
-            self.start_worker(handleTranslation, toTranslate, l1, l2)
+            #self.start_worker(handleTranslation, toTranslate, l1, l2)
+            self.runPipeline(l1, l2)
+            logging.info("calling translate")
+            res = translate(toTranslate, self.pipeline_locks[(l1, l2)], self.pipelines[(l1, l2)])
+            tornado.ioloop.IOLoop.instance().add_future(res, handleTranslation)
+            #handleTranslation()
             self.notePairUsage((l1, l2))
             self.cleanPairs()
         else:
