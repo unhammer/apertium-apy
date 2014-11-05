@@ -23,7 +23,7 @@ import toro
 
 from modeSearch import searchPath
 from util import getLocalizedLanguages, apertium, bilingualTranslate, removeLast, stripTags, processPerWord, getCoverage, getCoverages, toAlpha3Code, toAlpha2Code, noteUnknownToken, scaleMtLog, TranslationInfo, closeDb, flushUnknownWords, inMemoryUnknownToken
-from translation import translate, translateDoc, parseModeFile
+import translation
 from keys import getKey
 
 try:
@@ -205,28 +205,8 @@ class TranslateHandler(BaseHandler):
         if (l1, l2) not in self.pipelines:
             logging.info('%s-%s not in pipelines of this process, starting …' % (l1, l2))
             mode_path = self.pairs['%s-%s' % (l1, l2)]
-            try:
-                do_flush, commands = parseModeFile(mode_path)
-            except Exception as e:
-                self.send_error(500, explanation="mode error")
-                return
-
-            procs = []
-            for i, cmd in enumerate(commands):
-                if i == 0:
-                    in_from = tornado.process.Subprocess.STREAM
-                else:
-                    in_from = procs[-1].stdout
-                if i == len(commands)-1:
-                    out_from = tornado.process.Subprocess.STREAM
-                else:
-                    out_from = PIPE
-                procs.append(tornado.process.Subprocess(cmd,
-                                                        stdin=in_from,
-                                                        stdout=out_from))
-
+            self.pipelines[(l1, l2)] = translation.startPipeline(mode_path)
             self.pipeline_locks[(l1, l2)] = toro.Lock()
-            self.pipelines[(l1, l2)] = (procs[0], procs[-1], do_flush)
 
     def logBeforeTranslation(self):
         if self.scaleMtLogs:
@@ -260,7 +240,9 @@ class TranslateHandler(BaseHandler):
         if '%s-%s' % (l1, l2) in self.pairs:
             before = self.logBeforeTranslation()
             self.runPipeline(l1, l2)
-            translated = yield translate(toTranslate, self.pipeline_locks[(l1, l2)], self.pipelines[(l1, l2)])
+            translated = yield translation.translate(toTranslate,
+                                                     self.pipeline_locks[(l1, l2)],
+                                                     self.pipelines[(l1, l2)])
             self.logAfterTranslation(before, toTranslate)
             self.sendResponse({
                 'responseData': {
@@ -352,7 +334,7 @@ class TranslateDocHandler(TranslateHandler):
                         self.request.headers['Content-Type'] = 'application/octet-stream'
                         self.request.headers['Content-Disposition'] = 'attachment'
 
-                        self.write(translateDoc(tempFile, allowedMimeTypes[mtype], self.pairs['%s-%s' % (l1, l2)]))
+                        self.write(translation.translateDoc(tempFile, allowedMimeTypes[mtype], self.pairs['%s-%s' % (l1, l2)]))
                         self.finish()
                     else:
                         self.send_error(400, explanation='Invalid file type %s' % mtype)

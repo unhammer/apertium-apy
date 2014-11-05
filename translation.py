@@ -1,7 +1,27 @@
 import re, threading, os, tempfile
 from subprocess import Popen, PIPE
 from tornado import gen
+import tornado.process
 import logging
+
+def startPipeline(mode_path):
+    do_flush, commands = parseModeFile(mode_path)
+
+    procs = []
+    for i, cmd in enumerate(commands):
+        if i == 0:
+            in_from = tornado.process.Subprocess.STREAM
+        else:
+            in_from = procs[-1].stdout
+        if i == len(commands)-1:
+            out_from = tornado.process.Subprocess.STREAM
+        else:
+            out_from = PIPE
+        procs.append(tornado.process.Subprocess(cmd,
+                                                stdin=in_from,
+                                                stdout=out_from))
+
+    return (procs[0], procs[-1], do_flush)
 
 def parseModeFile(mode_path):
     mode_str = open(mode_path, 'r').read().strip()
