@@ -3,7 +3,7 @@
 # coding=utf-8
 # -*- encoding: utf-8 -*-
 
-import sys, threading, os, re, ssl, argparse, logging, time, signal, tempfile, zipfile
+import sys, os, re, ssl, argparse, logging, time, signal, tempfile, zipfile
 from lxml import etree
 from subprocess import Popen, PIPE
 from multiprocessing import Pool, TimeoutError
@@ -18,6 +18,8 @@ try: #3.1
     from tornado.log import enable_pretty_logging
 except ImportError: #2.1
     from tornado.options import enable_pretty_logging
+
+import toro
 
 from modeSearch import searchPath
 from util import getLocalizedLanguages, apertium, bilingualTranslate, removeLast, stripTags, processPerWord, getCoverage, getCoverages, toAlpha3Code, toAlpha2Code, noteUnknownToken, scaleMtLog, TranslationInfo, closeDb, flushUnknownWords, inMemoryUnknownToken
@@ -72,7 +74,7 @@ class BaseHandler(tornado.web.RequestHandler):
     # simultaneously to a pipeline; then the first thread to read
     # might read translations of text put there by the second
     # thread …
-    pipeline_locks = {} # (l1, l2): threading.RLock() for (l1, l2) in pairs
+    pipeline_locks = {} # (l1, l2): lock for (l1, l2) in pairs
 
     def initialize(self):
         self.callback = self.get_argument('callback', default=None)
@@ -216,7 +218,7 @@ class TranslateHandler(BaseHandler):
                                                         stdin=in_from,
                                                         stdout=out_from))
 
-            self.pipeline_locks[(l1, l2)] = threading.RLock()
+            self.pipeline_locks[(l1, l2)] = toro.Lock()
             self.pipelines[(l1, l2)] = (procs[0], procs[-1], do_flush)
 
     def logBeforeTranslation(self):
@@ -262,8 +264,7 @@ class TranslateHandler(BaseHandler):
             return
 
         def handleTranslation(fut):
-            res = fut.result()
-            translated = b"".join(res).decode('utf-8')
+            translated = fut.result()
             self.noteUnknownTokens('-'.join((l1, l2)), translated)
             translatedU = translated if markUnknown else self.stripUnknownMarks(translated)
             self.sendResponse({
@@ -274,12 +275,9 @@ class TranslateHandler(BaseHandler):
             return
 
         if '%s-%s' % (l1, l2) in self.pairs:
-            #self.start_worker(handleTranslation, toTranslate, l1, l2)
             self.runPipeline(l1, l2)
-            logging.info("calling translate")
-            res = translate(toTranslate, self.pipeline_locks[(l1, l2)], self.pipelines[(l1, l2)])
-            tornado.ioloop.IOLoop.instance().add_future(res, handleTranslation)
-            #handleTranslation()
+            fut = translate(toTranslate, self.pipeline_locks[(l1, l2)], self.pipelines[(l1, l2)])
+            tornado.ioloop.IOLoop.instance().add_future(fut, handleTranslation)
             self.notePairUsage((l1, l2))
             self.cleanPairs()
         else:

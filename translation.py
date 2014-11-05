@@ -52,13 +52,12 @@ def translateSplitting(toTranslate, translock, pipeline):
         allSplit.append(toTranslate[last:cur])
         last = cur
     res = yield [translateNULFlush(part, translock, pipeline) for part in allSplit]
-    return res
-    
+    return "".join(res)
+
 @gen.coroutine
 def translateNULFlush(toTranslate, translock, pipeline):
-    logging.info(translock)
-    with translock:
-        logging.info(translock)
+    with (yield translock.acquire()):
+        assert translock.locked()
         proc_in, proc_out, do_flush = pipeline
         assert(do_flush)
 
@@ -71,12 +70,12 @@ def translateNULFlush(toTranslate, translock, pipeline):
         # TODO: PipeIOStream has no flush, but seems to work anyway?
         #proc_in.stdin.flush()
 
-        line = yield proc_out.stdout.read_until(bytes('\0', 'utf-8'))
-        return line
+        output = yield proc_out.stdout.read_until(bytes('\0', 'utf-8'))
 
-        # proc_reformat = Popen("apertium-rehtml-noent", stdin=PIPE, stdout=PIPE)
-        # proc_reformat.stdin.write(output)
-        # return proc_reformat.communicate()[0].decode('utf-8')
+        proc_reformat = Popen("apertium-rehtml-noent", stdin=PIPE, stdout=PIPE)
+        proc_reformat.stdin.write(output)
+        return proc_reformat.communicate()[0].decode('utf-8')
+
 
 def hardbreakFn():
     """If others are waiting on us, we send short requests, otherwise we
@@ -117,17 +116,15 @@ def translateWithoutFlush(toTranslate, translock, pipeline):
 
 @gen.coroutine
 def translateSimple(toTranslate, translock, pipeline):
-    with translock:
+    with (yield translock.acquire()):
+        assert translock.locked()
         proc_in, proc_out, do_flush = pipeline
         assert(not do_flush)
         assert(proc_in==proc_out)
-        logging.info("writing")
         proc_in.stdin.write(bytes(toTranslate, 'utf-8'))
         proc_in.stdin.close()
-        logging.info("reading")
         translated = yield proc_out.stdout.read_until_close()
-        logging.info(translated)
-        return [translated]
+        return translated.decode('utf-8')
 
 def translateDoc(fileToTranslate, format, modeFile):
     return Popen(['apertium', '-f %s' % format, '-d %s' % os.path.dirname(os.path.dirname(modeFile)), os.path.splitext(os.path.basename(modeFile))[0]], stdin=fileToTranslate, stdout=PIPE).communicate()[0]
