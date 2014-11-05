@@ -11,7 +11,7 @@ from functools import wraps
 from threading import Thread
 from datetime import datetime
 
-import tornado, tornado.web, tornado.httpserver, tornado.process
+import tornado, tornado.web, tornado.httpserver, tornado.process, tornado.iostream
 from tornado import escape, gen
 from tornado.escape import utf8
 try: #3.1
@@ -58,7 +58,7 @@ class BaseHandler(tornado.web.RequestHandler):
     analyzers = {}
     generators = {}
     taggers = {}
-    pipelines = {} # (l1, l2): (inpipe, outpipe, do_flush)
+    pipelines = {} # (l1, l2): (inpipe, outpipe)
     callback = None
     timeout = None
     scaleMtLogs = False
@@ -74,6 +74,7 @@ class BaseHandler(tornado.web.RequestHandler):
     # simultaneously to a pipeline; then the first call to read might
     # read translations of text put there by the second call …
     pipeline_locks = {} # (l1, l2): lock for (l1, l2) in pairs
+    pipeline_cmds = {} # (l1, l2): (do_flush, commands)
 
     def initialize(self):
         self.callback = self.get_argument('callback', default=None)
@@ -167,8 +168,8 @@ class TranslateHandler(BaseHandler):
             self.stats['lastUsage'][pair] = time.time()
 
     unknownMarkRE = re.compile(r'\*([^.,;:\t\* ]+)')
-    def maybeStripMarks(self, markUnknown, pair, translated):
-        self.noteUnknownTokens("%s-%s" % pair, translated)
+    def maybeStripMarks(self, markUnknown, l1, l2, translated):
+        self.noteUnknownTokens("%s-%s" % (l1, l2), translated)
         if markUnknown:
             return translated
         else:
@@ -183,17 +184,17 @@ class TranslateHandler(BaseHandler):
                     noteUnknownToken(token, pair, self.missingFreqs)
 
     def shutdownPair(self, pair):
-        # TODO: this works (and is required) for the non-flushing pairs, untested for flushing pairs
+        logging.info("shutting down")
         self.pipelines[pair][0].stdin.close()
         self.pipelines[pair][0].stdout.close()
         self.pipelines.pop(pair)
-        self.pipeline_locks.pop(pair)
 
-    def cleanPairs(self, lastpair=None):
-        if lastpair:
-            _, _, do_flush = self.pipelines[lastpair]
-            if not do_flush:
-                self.shutdownPair(lastpair)
+    def cleanPairs(self, lastPair=None):
+        if lastPair:
+            # TODO: really we should pop any processes that have
+            # closed pipes, not just do_flush ones
+            if not self.do_flush[lastPair][0]:
+                self.shutdownPair(lastPair)
         if self.max_idle_secs:
             for pair, lastUsage in self.stats['lastUsage'].items():
                 if pair in self.pipelines and time.time() - lastUsage > self.max_idle_secs:
@@ -201,12 +202,25 @@ class TranslateHandler(BaseHandler):
                         pair[0], pair[1], self.max_idle_secs))
                     self.shutdownPair(pair)
 
-    def runPipeline(self, l1, l2):
+    def getPipeLock(self, l1, l2):
+        if (l1, l2) not in self.pipeline_locks:
+            self.pipeline_locks[(l1, l2)] = toro.Lock()
+        return self.pipeline_locks[(l1, l2)]
+
+    def getPipeCmds(self, l1, l2):
+        if (l1, l2) not in self.pipeline_cmds:
+            mode_path = self.pairs['%s-%s' % (l1, l2)]
+            self.pipeline_cmds[(l1, l2)] = translation.parseModeFile(mode_path)
+        return self.pipeline_cmds[(l1, l2)]
+
+    def getPipeline(self, l1, l2):
+        do_flush, commands = self.getPipeCmds(l1, l2)
+        if not do_flush:
+            return None
         if (l1, l2) not in self.pipelines:
             logging.info('%s-%s not in pipelines of this process, starting …' % (l1, l2))
-            mode_path = self.pairs['%s-%s' % (l1, l2)]
-            self.pipelines[(l1, l2)] = translation.startPipeline(mode_path)
-            self.pipeline_locks[(l1, l2)] = toro.Lock()
+            self.pipelines[(l1, l2)] = translation.startPipeline(commands)
+        return self.pipelines[(l1, l2)]
 
     def logBeforeTranslation(self):
         if self.scaleMtLogs:
@@ -239,20 +253,20 @@ class TranslateHandler(BaseHandler):
 
         if '%s-%s' % (l1, l2) in self.pairs:
             before = self.logBeforeTranslation()
-            self.runPipeline(l1, l2)
-            translated = yield translation.translate(toTranslate,
-                                                     self.pipeline_locks[(l1, l2)],
-                                                     self.pipelines[(l1, l2)])
+            lock = self.getPipeLock(l1, l2)
+            _, commands = self.getPipeCmds(l1, l2)
+            pipeline = self.getPipeline(l1, l2)
+            translated = yield translation.translate(toTranslate, lock, pipeline, commands)
             self.logAfterTranslation(before, toTranslate)
             self.sendResponse({
                 'responseData': {
-                    'translatedText': self.maybeStripMarks(markUnknown, (l1, l2), translated)
+                    'translatedText': self.maybeStripMarks(markUnknown, l1, l2, translated)
                 },
                 'responseDetails': None,
                 'responseStatus': 200
             })
             self.notePairUsage((l1, l2))
-            self.cleanPairs(lastpair=(l1,l2))
+            self.cleanPairs(lastPair=(l1,l2))
         else:
             self.send_error(400, explanation='That pair is not installed')
             if self.scaleMtLogs:
