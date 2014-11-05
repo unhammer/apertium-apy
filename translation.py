@@ -29,8 +29,7 @@ def parseModeFile(mode_path):
         logging.error('Could not parse mode file %s' % mode_path)
         raise Exception('Could not parse mode file %s' % mode_path)
 
-@gen.coroutine
-def translateSplitting(toTranslate, translock, pipeline):
+def splitForTranslation(toTranslate):
     """Splitting it up a bit ensures we don't fill up FIFO buffers (leads
     to processes hanging on read/write)."""
     allSplit = []	# [].append and join faster than str +=
@@ -51,8 +50,7 @@ def translateSplitting(toTranslate, translock, pipeline):
                 cur = last+hardbreak
         allSplit.append(toTranslate[last:cur])
         last = cur
-    res = yield [translateNULFlush(part, translock, pipeline) for part in allSplit]
-    return "".join(res)
+    return allSplit
 
 @gen.coroutine
 def translateNULFlush(toTranslate, translock, pipeline):
@@ -121,7 +119,7 @@ def translateSimple(toTranslate, translock, pipeline):
         proc_in, proc_out, do_flush = pipeline
         assert(not do_flush)
         assert(proc_in==proc_out)
-        proc_in.stdin.write(bytes(toTranslate, 'utf-8'))
+        yield proc_in.stdin.write(bytes(toTranslate, 'utf-8'))
         proc_in.stdin.close()
         translated = yield proc_out.stdout.read_until_close()
         return translated.decode('utf-8')
@@ -133,7 +131,9 @@ def translateDoc(fileToTranslate, format, modeFile):
 def translate(toTranslate, translock, pipeline):
     _, _, do_flush = pipeline
     if do_flush:
-        res = yield translateSplitting(toTranslate, translock, pipeline)
+        allSplit = splitForTranslation(toTranslate)
+        parts = yield [translateNULFlush(part, translock, pipeline) for part in allSplit]
+        return "".join(parts)
     else:
         res = yield translateSimple(toTranslate, translock, pipeline)
-    return res
+        return res
