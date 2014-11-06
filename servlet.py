@@ -58,7 +58,7 @@ class BaseHandler(tornado.web.RequestHandler):
     analyzers = {}
     generators = {}
     taggers = {}
-    pipelines = {} # (l1, l2): (inpipe, outpipe)
+    pipelines = {} # (l1, l2): (inpipe, outpipe), only contains flushing pairs!
     callback = None
     timeout = None
     scaleMtLogs = False
@@ -211,12 +211,7 @@ class TranslateHandler(BaseHandler):
         self.pipelines[pair][0].stdout.close()
         self.pipelines.pop(pair)
 
-    def cleanPairs(self, lastPair=None):
-        if lastPair:
-            # TODO: really we should pop any processes that have
-            # closed pipes, not just do_flush ones
-            if not self.do_flush[lastPair][0]:
-                self.shutdownPair(lastPair)
+    def cleanPairs(self):
         if self.max_idle_secs:
             for pair, lastUsage in self.stats['lastUsage'].items():
                 if pair in self.pipelines and time.time() - lastUsage > self.max_idle_secs:
@@ -288,7 +283,7 @@ class TranslateHandler(BaseHandler):
                 'responseStatus': 200
             })
             self.notePairUsage((l1, l2))
-            self.cleanPairs(lastPair=(l1,l2))
+            self.cleanPairs()
         else:
             self.send_error(400, explanation='That pair is not installed')
             if self.scaleMtLogs:
