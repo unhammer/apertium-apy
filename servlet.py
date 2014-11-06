@@ -64,10 +64,12 @@ class BaseHandler(tornado.web.RequestHandler):
     scaleMtLogs = False
     inMemoryUnknown = False
     inMemoryLimit = -1
+    verbosity = 0
 
     stats = {
         'useCount': {},
         'lastUsage': {},
+        'vmsize': 0,
     }
 
     # The lock is needed so we don't let two coroutines write
@@ -79,7 +81,27 @@ class BaseHandler(tornado.web.RequestHandler):
     def initialize(self):
         self.callback = self.get_argument('callback', default=None)
 
+    def log_vmsize(self):
+        if self.verbosity < 1:
+            return
+        scale = {'kB': 1024, 'mB': 1048576,
+                 'KB': 1024, 'MB': 1048576}
+        try:
+            for line in open('/proc/%d/status' % os.getpid()):
+                if line.startswith('VmSize:'):
+                    _, num, unit = line.split()
+                    break
+            vmsize = int(num) * scale[unit]
+            if vmsize > self.stats['vmsize']:
+                logging.warning("VmSize of %s from %d to %d" % (os.getpid(), self.stats['vmsize'], vmsize))
+                self.stats['vmsize'] = vmsize
+        except:
+            # don't let a stupid logging function mess us up
+            pass
+
+
     def sendResponse(self, data):
+        self.log_vmsize()
         if isinstance(data, dict) or isinstance(data, list):
             data = escape.json_encode(data)
             self.set_header('Content-Type', 'application/json; charset=UTF-8')
@@ -601,6 +623,7 @@ def setupHandler(port, pairs_path, nonpairs_path, langNames, missingFreqs, timeo
     Handler.scaleMtLogs = scaleMtLogs
     Handler.inMemoryUnknown = True if memory > 0 else False
     Handler.inMemoryLimit = memory
+    Handler.verbosity = verbosity
 
     modes = searchPath(pairs_path, verbosity=verbosity)
     if nonpairs_path:
