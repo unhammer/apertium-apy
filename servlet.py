@@ -176,8 +176,12 @@ class ListHandler(BaseHandler):
 class StatsHandler(BaseHandler):
     @tornado.web.asynchronous
     def get(self):
+        stats = { '%s-%s' % pair: { 'useCount': useCount,
+                                    'lastUsage': lastUsage }
+                  for pair, useCount in self.stats['useCount'].items()
+                  for lastUsage in [self.stats['lastUsage'].get(pair, False)] }
         self.sendResponse({
-            'responseData': { '%s-%s' % pair: useCount for pair, useCount in self.stats['useCount'].items() },
+            'responseData': stats,
             'responseDetails': None,
             'responseStatus': 200
         })
